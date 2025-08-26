@@ -622,5 +622,106 @@ if [[ $INSTALL_GPU_METRICS_EXPORTER = "true" ]]; then
 
 fi
 
+if [[ $INSTALL_WORKLOAD_AUTOSCALER = "true" ]]; then
+  K8S_PROVIDER="gke"
+  WORKLOAD_AUTOSCALER_CONFIG_SOURCE="castai-cluster-controller"
+  WORKLOAD_AUTOSCALER_CHART=${WORKLOAD_AUTOSCALER_CHART:-"castai-helm/castai-workload-autoscaler"}
+  WORKLOAD_AUTOSCALER_EXPORTER_CHART=${WORKLOAD_AUTOSCALER_EXPORTER_CHART:-"castai-helm/castai-workload-autoscaler-exporter"}
+
+  bare_header() {
+    HEADER_COLOR="6" # cyan
+    if tput bold &>/dev/null && tput sgr0 &>/dev/null; then
+      tput bold
+      if tput setaf "$HEADER_COLOR" &>/dev/null; then
+        tput setaf "$HEADER_COLOR"
+      fi
+      echo "█ $@"
+      tput sgr0
+    else
+      echo "█ $@"
+    fi
+  }
+
+  success() {
+    HEADER_COLOR="2" # green
+    if tput bold &>/dev/null && tput sgr0 &>/dev/null; then
+      tput bold
+      if tput setaf "$HEADER_COLOR" &>/dev/null; then
+        tput setaf "$HEADER_COLOR"
+      fi
+      echo "✓ $@"
+      tput sgr0
+    else
+      echo "✓ $@"
+    fi
+  }
+
+  header() {
+    echo
+    bare_header $@
+  }
+
+  install_metrics_server() {
+    if ! kubectl get --raw /apis/metrics.k8s.io >/dev/null 2>&1; then
+      header "Installing Kubernetes metrics-server."
+      kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      success "Finished installing Kubernetes metrics-server."
+
+      header "Waiting for Kubernetes metrics-server to be ready."
+      INSECURE_TLS_HANDLED=0
+      INTERNAL_NETWORKING_HANDLED=0
+      while ! kubectl -nkube-system wait "--for=condition=Ready" pod -l k8s-app=metrics-server --timeout=5s >/dev/null 2>&1; do
+        # Handle the case when --kubelet-insecure-tls is required, i.e. local machines or Linode
+        if [[ "$INSECURE_TLS_HANDLED" == "0" && "$(kubectl -nkube-system logs -l k8s-app=metrics-server 2>&1 | grep 'cannot validate certificate')" != "" ]]; then
+          header "Enabling self-signed certificate support in Kubernetes metrics-server."
+          kubectl -nkube-system patch deployment metrics-server --type json -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]' -n kube-system
+          header "Waiting for Kubernetes metrics-server to be ready after changes."
+          INSECURE_TLS_HANDLED=1
+        elif [[ "$INTERNAL_NETWORKING_HANDLED" == "0" && "$(kubectl -nkube-system logs -l k8s-app=metrics-server 2>&1 | grep 'dial tcp')" != "" ]]; then
+          header "Enabling InternalIP as an address preference in Kubernetes metrics-server."
+          kubectl -nkube-system patch deployment metrics-server --type json -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-preferred-address-types=InternalIP,Hostname,InternalDNS,ExternalDNS,ExternalIP"}]' -n kube-system
+          header "Waiting for Kubernetes metrics-server to be ready after changes."
+          INTERNAL_NETWORKING_HANDLED=1
+        fi
+
+        sleep 5
+      done
+      success "Kubernetes metrics-server is ready."
+    fi
+  }
+
+  install_workload_autoscaler() {
+    header "Installing castai-workload-autoscaler."
+    helm upgrade -i castai-workload-autoscaler -n castai-agent $WORKLOAD_AUTOSCALER_EXTRA_HELM_OPTS \
+      --set castai.apiKeySecretRef="$WORKLOAD_AUTOSCALER_CONFIG_SOURCE" \
+      --set castai.configMapRef="$WORKLOAD_AUTOSCALER_CONFIG_SOURCE" \
+      "$WORKLOAD_AUTOSCALER_CHART"
+    success "Finished installing castai-workload-autoscaler."
+  }
+
+  test_workload_autoscaler_logs() {
+    echo -e "Test of castai-workload-autoscaler has failed. See: https://docs.cast.ai/docs/workload-autoscaling-overview#failed-helm-test-hooks\n"
+    kubectl logs -n castai-agent pod/test-castai-workload-autoscaler-verification
+    exit 1
+  }
+
+  test_workload_autoscaler() {
+    header "Testing castai-workload-autoscaler."
+    trap test_workload_autoscaler_logs INT TERM ERR
+    kubectl rollout status deployment/castai-workload-autoscaler -n castai-agent --timeout=300s
+    helm test castai-workload-autoscaler -n castai-agent
+    success "Finished testing castai-workload-autoscaler."
+  }
+
+  main() {
+    install_metrics_server
+    install_workload_autoscaler
+    test_workload_autoscaler
+  }
+
+  main
+
+fi
+
 echo "Scaling castai-agent:"
 kubectl scale deployments/castai-agent --replicas=2 --namespace castai-agent
